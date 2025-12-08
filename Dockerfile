@@ -23,7 +23,7 @@ COPY . .
 RUN python3 model/train.py
 
 # Expose the port your app runs on
-EXPOSE 8080
+EXPOSE 6000
 
 # Start the app with gunicorn (4 workers, bind to 0.0.0.0:6000)
 CMD ["gunicorn", "--workers", "4", "--bind", "0.0.0.0:6000", "app:app"]
