@@ -1,170 +1,120 @@
-# Deploy Intent Classifier on VMs (AWS VPC + ASG + ALB) — CLI Steps
+# Deploy Intent Classifier on GCP (Compute Engine + MIG) using Cloud Shell
 
-This simple step-by-step guide shows how to deploy your Intent Classifier model on AWS using EC2 instances in an Auto Scaling Group (ASG) behind an Application Load Balancer (ALB).
+This guide shows how to deploy a **production-ready Intent Classifier ML API**
+on **Google Cloud Platform (GCP)** using **Cloud Shell only**.
 
-### 1. Find a recent Ubuntu AMI for your region
+No Terraform.  
+No Kubernetes.  
+Pure `gcloud` CLI + Compute Engine.
 
-A quick way to locate an official Ubuntu AMI (example uses AWS CLI):
+---
 
-```
-aws ec2 describe-images \
---owners 099720109477 \
---filters "Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-focal-20.04-amd64-server-*" "Name=state,Values=available" \
---query 'Images | sort_by(@, &CreationDate)[-1].ImageId' --output text --region $AWS_REGION
-```
+## Architecture Overview
 
-This prints the latest Ubuntu 20.04 AMI ID for the region. Adjust the name filter to whichever you need.
+- GCP VPC Network
+- Public Subnet
+- Compute Engine Instance Template
+- Managed Instance Group (Regional, Autoscaling)
+- Gunicorn (app server)
+- Nginx (reverse proxy)
+- Flask-based ML API
 
-### 2. Create a VPC, public subnets (multi-AZ), and Internet Gateway
+---
 
-For an ALB you must provide at least two subnets in different Availability Zones. We'll create two public subnets (one per AZ).
+## 0. Set Variables (Cloud Shell)
 
-- Create VPC
+```bash
+PROJECT_ID=$(gcloud config get-value project)
+REGION=us-central1
+ZONE1=us-central1-a
+ZONE2=us-central1-b
 
-```
-aws ec2 create-vpc --cidr-block 10.10.0.0/16 --query 'Vpc.VpcId' --output text --region $AWS_REGION
-```
+NETWORK=intent-vpc
+SUBNET=intent-public-subnet
+TEMPLATE=intent-template
+MIG=intent-mig
 
-Save the returned VPC id in VPC_ID.
 
-- Create two public subnets in different AZs (replace ${AWS_REGION}a/b if needed):
+1. Create VPC Subnet (Public)
 
-```
-aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.10.1.0/24 --availability-zone ${AWS_REGION}a --query 'Subnet.SubnetId' --output text --region $AWS_REGION
-```
+In GCP, a subnet is considered public when instances have external IPs.
 
-save as SUBNET_ID1
+gcloud compute networks subnets create intent-public-subnet \
+  --network intent-vpc \
+  --region us-central1 \
+  --range 10.10.0.0/16
 
-```
-aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.10.2.0/24 --availability-zone ${AWS_REGION}b --query 'Subnet.SubnetId' --output text --region $AWS_REGION
-```
+2. Create Firewall Rules
+Allow HTTP (Port 80)
+gcloud compute firewall-rules create allow-http \
+  --network intent-vpc \
+  --allow tcp:80 \
+  --source-ranges 0.0.0.0/0
 
-save as SUBNET_ID2
+Allow SSH (Port 22)
+gcloud compute firewall-rules create allow-ssh \
+  --network intent-vpc \
+  --allow tcp:22 \
+  --source-ranges 0.0.0.0/0
 
-- Create and attach an Internet Gateway
+3. Clone Application Repository
+git clone https://github.com/iam-veeramalla/Intent-classifier-model.git
+cd Intent-classifier-model
+git checkout virtual-machines
 
-```
-aws ec2 create-internet-gateway --query 'InternetGateway.InternetGatewayId' --output text --region $AWS_REGION
-```
 
-save as IGW_ID
+This branch contains:
 
-```
-aws ec2 attach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID --region $AWS_REGION
-```
+userdata.sh
 
-- Create a route table and route 0.0.0.0/0 to IGW and associate with both subnets
+Gunicorn setup
 
-```
-aws ec2 create-route-table --vpc-id $VPC_ID --query 'RouteTable.RouteTableId' --output text --region $AWS_REGION
-```
+Nginx configuration
 
-save as RTB_ID
+4. Create Instance Template
 
-```
-aws ec2 create-route --route-table-id $RTB_ID --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID --region $AWS_REGION
-```
+This template defines how Compute Engine VMs are launched.
 
-```
-aws ec2 associate-route-table --route-table-id $RTB_ID --subnet-id $SUBNET_ID1 --region $AWS_REGION
-aws ec2 associate-route-table --route-table-id $RTB_ID --subnet-id $SUBNET_ID2 --region $AWS_REGION
-```
+gcloud compute instance-templates create intent-template \
+  --machine-type e2-medium \
+  --network intent-vpc \
+  --subnet projects/$PROJECT_ID/regions/us-central1/subnetworks/intent-public-subnet \
+  --tags http-server \
+  --image-family ubuntu-2204-lts \
+  --image-project ubuntu-os-cloud \
+  --metadata-from-file startup-script=userdata.sh \
+  --boot-disk-size 10GB
 
-Optional: enable auto-assign public IP for the subnets so instances get public addresses (helpful for debugging):
+5. Create Managed Instance Group (MIG)
 
-```
-aws ec2 modify-subnet-attribute --subnet-id $SUBNET_ID1 --map-public-ip-on-launch
-aws ec2 modify-subnet-attribute --subnet-id $SUBNET_ID2 --map-public-ip-on-launch
-```
+The MIG provides high availability and autoscaling.
 
-### 3. Create Security Group for instances
+gcloud compute instance-groups managed create intent-mig \
+  --base-instance-name intent-vm \
+  --template intent-template \
+  --size 1 \
+  --zones us-central1-a,us-central1-b
 
-Create a security group that allows traffic from the ALB (on port 80) and SSH from your IP (or nothing for production):
+6. Enable Autoscaling
+gcloud compute instance-groups managed set-autoscaling intent-mig \
+  --region us-central1 \
+  --min-num-replicas 1 \
+  --max-num-replicas 2 \
+  --target-cpu-utilization 0.8
 
-```
-aws ec2 create-security-group --group-name intent-sg --description "Allow app and ssh" --vpc-id $VPC_ID --query 'GroupId' --output text --region $AWS_REGION
-```
+7. Verify Application on VM
 
-save as SG_ID
+SSH into a running instance:
 
-Add rules:
+gcloud compute instances list
+gcloud compute ssh <INSTANCE_NAME> --zone us-central1-a
 
-```
-aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 80 --cidr 0.0.0.0/0 --region $AWS_REGION
-```
 
-Open SSH 
+Test the ML API:
 
-```
-aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 22 --cidr 0.0.0.0/0 --region $AWS_REGION
-```
+curl -X POST http://127.0.0.1:6000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"text":"I want to cancel my subscription"}'
 
-Note: allowing 0.0.0.0/0 to port 80 is simple for beginners but not ideal for production. The more secure pattern is:
-Create an ALB security group that allows inbound HTTP/HTTPS from the internet. Configure the instance security group to only allow inbound traffic from the ALB security group's ID.
-
-### 5. Create Launch Template (includes user-data)
-
-A Launch Template defines how EC2 instances are launched (AMI, instance type, key pair, security groups, IAM instance profile, and user-data). Below are two straightforward ways to create a launch template from the CLI.
-
-Prepare your user-data
-
-Create a user-data.sh file with your startup script (refer userdata.sh). Make sure it is executable text.
-
-- Ensure these are exported: AMI_ID, INSTANCE_TYPE, KEY_NAME, LAUNCH_TEMPLATE_NAME
-
-```
-USER_DATA=$(base64 -w0 userdata.sh)
-aws ec2 create-launch-template \
---launch-template-name "$LAUNCH_TEMPLATE_NAME" \
---version-description "v1" \
---launch-template-data "{\"ImageId\":\"$AMI_ID\",\"InstanceType\":\"$INSTANCE_TYPE\",\"KeyName\":\"$KEY_NAME\",\"SecurityGroupIds\":[\"$SG_ID\"],\"UserData\":\"$USER_DATA\"}" \
---region $AWS_REGION
-```
-
-### 6. Create Target Group and Application Load Balancer (ALB)
-
-- Create target group (instances will be registered automatically by ASG)
-
-```
-aws elbv2 create-target-group --name mlops-target-group --protocol HTTP --port 80 --vpc-id $VPC_ID --health-check-protocol HTTP --health-check-path /health --matcher HttpCode=200 --region $AWS_REGION
-```
-
-Save target group arn from output as TARGET_GROUP_ARN.
-
-- Create an ALB (public) in the two subnets you created. The --subnets parameter must include at least two subnets in different AZs
-
-```
-aws elbv2 create-load-balancer --name model-deployment --subnets $SUBNET_ID1 $SUBNET_ID2 --security-groups $SG_ID --scheme internet-facing --type application --region $AWS_REGION
-```
-
-save as ALB_ARN
-
-- Create a listener to forward traffic from port 80 to the target group
-
-```
-aws elbv2 create-listener --load-balancer-arn $ALB_ARN --protocol HTTP --port 80 --default-actions Type=forward,TargetGroupArn=$TARGET_GROUP_ARN --region $AWS_REGION
-```
-
-### 7. Create Auto Scaling Group that uses the Launch Template
-
-Create the autoscaling group in both subnets and attach it to the target group so that instances are automatically registered.
-
-```
-aws autoscaling create-auto-scaling-group \
---auto-scaling-group-name mlops-autoscaling \
---launch-template LaunchTemplateName=mlops-template,Version=1 \
---min-size 1 --max-size 3 --desired-capacity 1 \
---vpc-zone-identifier "$SUBNET_ID1,$SUBNET_ID2" \
---region $AWS_REGION
-```
-
-### 8. Attach the Target Group to ASG 
-
-This ensures instances are automatically registered with the ALB target group:
-
-```
-aws autoscaling attach-load-balancer-target-groups \
---auto-scaling-group-name mlops-autoscaling \
---target-group-arns "$TARGET_GROUP_ARN" \
---region $AWS_REGION
-```
+Example Response
+{"intent":"complaint"}
