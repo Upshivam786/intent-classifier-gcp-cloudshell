@@ -60,7 +60,7 @@ gcloud compute firewall-rules create allow-ssh \
 3. Clone Application Repository
 git clone https://github.com/Upshivam786/intent-classifier-gcp-cloudshell.git
 cd Intent-classifier-model
-git checkout virtual-machines
+
 
 
 This branch contains:
